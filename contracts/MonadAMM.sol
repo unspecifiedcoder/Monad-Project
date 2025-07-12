@@ -5,14 +5,14 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
+interface ILPBadge {
+    function mintBadge(address to) external;
+}
+
 interface ILPToken {
     function mint(address to, uint256 amount) external;
     function burn(address from, uint256 amount) external;
     function totalSupply() external view returns (uint256);
-}
-
-interface ILPBadge {
-    function mintBadge(address to, string calldata uri) external;
 }
 
 contract MonadAMM is Ownable {
@@ -22,7 +22,8 @@ contract MonadAMM is Ownable {
     ILPToken public lpToken;
     IERC721 public lpBadge;
     uint256 public constant LP_BADGE_THRESHOLD = 5e18;
-    string public constant LP_BADGE_METADATA_URI = "ipfs://bafkreigbqlikf7bg5hfqvkxac6ia53jeunkhdm4eaf2eo2imbxkn4u4amq/lp_badge.json    ";
+    // This URI is now used by the LPBadge contract itself, not passed in the call.
+    string public constant LP_BADGE_METADATA_URI = "ipfs://bafkreigbqlikf7bg5hfqvkxac6ia53jeunkhdm4eaf2eo2imbxkn4u4amq/lp_badge.json";
 
     uint256 public constant FEE_BPS = 30;
     uint256 public constant BASIS_POINTS_MAX = 10000;
@@ -39,21 +40,9 @@ contract MonadAMM is Ownable {
     constructor(address _tokenA, address _tokenB) Ownable(msg.sender) {
         tokenA = _tokenA;
         tokenB = _tokenB;
-        charityRecipient = msg.sender; // Default to contract deployer
+        charityRecipient = msg.sender;
     }
     
-    function setCharityRecipient(address _recipient) external onlyOwner {
-        require(_recipient != address(0), "Zero address");
-        charityRecipient = _recipient;
-        emit CharityRecipientChanged(_recipient);
-    }
-
-    function setCharityFeeBps(uint256 _feeBps) external onlyOwner {
-        require(_feeBps <= 100, "Max 1%"); // safety: max 1%
-        charityFeeBps = _feeBps;
-        emit CharityFeeChanged(_feeBps);
-    }
-
     function setLPToken(address _lpToken) public onlyOwner {
         require(address(lpToken) == address(0), "LP token already set");
         lpToken = ILPToken(_lpToken);
@@ -64,35 +53,15 @@ contract MonadAMM is Ownable {
         lpBadge = IERC721(_lpBadge);
     }
 
-    // --- Helper functions for native/ERC20 handling ---
-
-    function _balanceOf(address token, address account) internal view returns (uint256) {
-        if (token == address(0)) {
-            return account.balance;
-        } else {
-            return IERC20(token).balanceOf(account);
-        }
-    }
 
     function _transferIn(address token, uint256 amount) internal {
         if (token == address(0)) {
             require(msg.value == amount, "Incorrect native value sent");
         } else {
-            require(msg.value == 0, "No native value expected");
             require(IERC20(token).transferFrom(msg.sender, address(this), amount), "ERC20 transfer failed");
         }
     }
 
-    function _transferOut(address token, address to, uint256 amount) internal {
-        if (token == address(0)) {
-            (bool sent, ) = to.call{value: amount}("");
-            require(sent, "Native transfer failed");
-        } else {
-            require(IERC20(token).transfer(to, amount), "ERC20 transfer failed");
-        }
-    }
-
-    // --- Liquidity Functions ---
 
     function addLiquidity(
         uint256 amountADesired,
@@ -100,19 +69,19 @@ contract MonadAMM is Ownable {
         uint256 amountAMin,
         uint256 amountBMin
     ) external payable returns (uint256 lpMintedAmount) {
-        // Determine which token is native and handle accordingly
         uint256 reserveA = _balanceOf(tokenA, address(this));
         uint256 reserveB = _balanceOf(tokenB, address(this));
+
+        // Adjust reserves for incoming native currency to prevent calculation errors on first deposit
+        if(tokenA == address(0)) {
+            reserveA -= msg.value;
+        } else if (tokenB == address(0)) {
+            reserveB -= msg.value;
+        }
 
         uint256 amountA;
         uint256 amountB;
 
-        // Handle native token input
-        if (tokenA == address(0) && tokenB == address(0)) {
-            revert("Both tokens cannot be native");
-        }
-
-        // Accept native token if needed
         if (tokenA == address(0)) {
             amountA = msg.value;
             amountB = amountBDesired;
@@ -128,31 +97,25 @@ contract MonadAMM is Ownable {
             _transferIn(tokenB, amountB);
         }
 
-        // Initial liquidity
-        if (reserveA == 0 || reserveB == 0) {
+        if (reserveA == 0 && reserveB == 0) {
             require(amountA >= amountAMin && amountB >= amountBMin, "Insufficient initial liquidity");
-            uint256 initialLP = 1000e18;
-            lpMintedAmount = initialLP;
+            lpMintedAmount = 1000e18;
             require(amountA * amountB > 1000, "Too little initial liquidity");
         } else {
-            // Optimal amounts
             uint256 amountBOptimal = (amountA * reserveB) / reserveA;
             if (amountBOptimal <= amountB) {
                 amountB = amountBOptimal;
             } else {
                 uint256 amountAOptimal = (amountB * reserveA) / reserveB;
-                require(amountAOptimal <= amountA, "Excessive slippage in A");
+                require(amountAOptimal <= amountA, "Slippage");
                 amountA = amountAOptimal;
             }
-            require(amountA >= amountAMin, "Insufficient A provided");
-            require(amountB >= amountBMin, "Insufficient B provided");
-
+            require(amountA >= amountAMin && amountB >= amountBMin, "Insufficient amounts");
             uint256 totalLP = lpToken.totalSupply();
             lpMintedAmount = (totalLP * amountA) / reserveA;
             require(lpMintedAmount > 0, "Too little liquidity added");
         }
 
-        // Refund any excess native token
         if (tokenA == address(0) && msg.value > amountA) {
             _transferOut(address(0), msg.sender, msg.value - amountA);
         }
@@ -160,17 +123,46 @@ contract MonadAMM is Ownable {
             _transferOut(address(0), msg.sender, msg.value - amountB);
         }
 
-        // Mint LP tokens
         lpToken.mint(msg.sender, lpMintedAmount);
 
-        // LP Badge logic (optional)
         uint256 addedValueInA = amountA + (amountB * reserveA) / (reserveB == 0 ? 1 : reserveB);
         if (addedValueInA >= LP_BADGE_THRESHOLD && address(lpBadge) != address(0)) {
-            ILPBadge(address(lpBadge)).mintBadge(msg.sender, LP_BADGE_METADATA_URI);
+            // --- FIX 2: Corrected the call ---
+            // Call mintBadge with only the recipient's address.
+            ILPBadge(address(lpBadge)).mintBadge(msg.sender);
         }
 
         emit AddLiquidity(msg.sender, amountA, amountB, lpMintedAmount);
         return lpMintedAmount;
+    }
+
+        function setCharityRecipient(address _recipient) external onlyOwner {
+        require(_recipient != address(0), "Zero address");
+        charityRecipient = _recipient;
+        emit CharityRecipientChanged(_recipient);
+    }
+
+    function setCharityFeeBps(uint256 _feeBps) external onlyOwner {
+        require(_feeBps <= 100, "Max 1%"); // safety: max 1%
+        charityFeeBps = _feeBps;
+        emit CharityFeeChanged(_feeBps);
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256) {
+        if (token == address(0)) {
+            return account.balance;
+        } else {
+            return IERC20(token).balanceOf(account);
+        }
+    }
+
+        function _transferOut(address token, address to, uint256 amount) internal {
+        if (token == address(0)) {
+            (bool sent, ) = to.call{value: amount}("");
+            require(sent, "Native transfer failed");
+        } else {
+            require(IERC20(token).transfer(to, amount), "ERC20 transfer failed");
+        }
     }
 
     function removeLiquidity(uint256 lpBurnAmount) external returns (uint256 amountA, uint256 amountB) {
@@ -267,6 +259,8 @@ contract MonadAMM is Ownable {
         amountOut = numerator / denominator;
     }
 
-    // Allow contract to receive native tokens
+
+
+    
     receive() external payable {}
 }
