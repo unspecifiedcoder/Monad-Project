@@ -1,0 +1,15 @@
+{
+  "name": "LP Badge",
+  "description": "This NFT commemorates a liquidity provider's contribution to the AMM.",
+  "image": "ipfs://bafybeicji2qbr7coptvr2rtong2wbap7b5zjz4hslyjsqnp425oyl7iixq",
+  "attributes": [
+    {
+      "trait_type": "Tier",
+      "value": "Gold"
+    },
+    {
+      "trait_type": "Protocol",
+      "value": "CustomAMM"
+    }
+  ]
+}
